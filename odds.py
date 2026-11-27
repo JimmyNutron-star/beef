@@ -28,11 +28,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 try:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except ImportError:
     ZoneInfo = None
+    ZoneInfoNotFoundError = None
 
 import requests
+
+
+class TimezoneError(RuntimeError):
+    pass
+
 
 # ================================================================ constants
 BASE = "https://odibets.com/pxy2/virtuals"
@@ -67,20 +73,63 @@ WINDOW_LEAD = 85         # betting window opens this many seconds before start
 
 
 # ================================================================ time
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # Python < 3.9
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
+
+# Fallback offsets (hours from UTC) for zones with NO DST.
+# Only used if the IANA database is unavailable on this machine.
+# Nairobi is UTC+3 year-round, so this is exactly correct.
+_FIXED_OFFSET_HOURS = {
+    "Africa/Nairobi": 3,
+    "Africa/Kampala": 3,
+    "Africa/Dar_es_Salaam": 3,
+    "UTC": 0,
+}
+
+
+def _resolve_tz(tz):
+    """Return a tzinfo for the given zone name, or None for naive/local time.
+
+    Order of preference:
+      1. zoneinfo.ZoneInfo (real IANA rules; needs system tzdata on Linux/macOS,
+         or the `tzdata` package on Windows).
+      2. A fixed-offset timezone from the built-in table (for zones without DST).
+      3. None -> naive local time (last resort).
+    """
+    if not tz:
+        return None
+
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, KeyError, OSError):
+            pass  # tzdata missing -> try fallback below
+
+    hours = _FIXED_OFFSET_HOURS.get(tz)
+    if hours is not None:
+        return timezone(timedelta(hours=hours))
+
+    # Unknown zone and no tzdata -> naive local time
+    return None
+
+
 def now_in(tz):
-    if tz:
-        if ZoneInfo is None:
-            raise RuntimeError("zoneinfo not available; pip install tzdata")
-        return datetime.now(ZoneInfo(tz))
-    return datetime.now()
+    z = _resolve_tz(tz)
+    return datetime.now(z) if z else datetime.now()
 
 
 def parse_dt(s, tz=None):
+    z = _resolve_tz(tz)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y %H:%M:%S"):
         try:
-            return datetime.strptime(s, fmt).replace(
-                tzinfo=ZoneInfo(tz)) if tz else datetime.strptime(s, fmt)
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=z) if z else dt
         except (ValueError, TypeError):
             continue
     return None
@@ -91,7 +140,6 @@ def fmt_hms(seconds):
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 # ================================================================ display
 class Display:
@@ -513,4 +561,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TimezoneError as e:
+        raise SystemExit(f"Error: {e}") from None
