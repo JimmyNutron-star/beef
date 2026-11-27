@@ -1,0 +1,24 @@
+spanish league
+selector - https://odibets.com/pxy2/virtuals?competition_id=2&tab=&period=&level=1&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+matches - https://odibets.com/pxy2/virtuals?competition_id=2&tab=&period=2026-11-27+13:17:00&level=3&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+markets - https://odibets.com/pxy2/virtuals?competition_id=2&tab=&period=2026-11-27+13:25:00&sub_type_id=GG&level=4&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+results - https://odibets.com/pxy2/virtuals?competition_id=2&tab=results&period=2026-11-27+13:19:00&level=2&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+
+kenyan league
+selector - https://odibets.com/pxy2/virtuals?competition_id=3&tab=&period=&level=1&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+matches - https://odibets.com/pxy2/virtuals?competition_id=3&tab=&period=2026-11-27+13:23:00&level=3&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+markets - https://odibets.com/pxy2/virtuals?competition_id=3&tab=&period=2026-11-27+13:23:00&sub_type_id=GG&level=4&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+results - https://odibets.com/pxy2/virtuals?competition_id=3&tab=results&period=2026-11-27+13:23:00&level=2&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+
+italian league
+selector - https://odibets.com/pxy2/virtuals?competition_id=4&tab=&period=&level=1&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+matches - https://odibets.com/pxy2/virtuals?competition_id=4&tab=&period=2026-11-27+13:28:00&level=3&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+markets - https://odibets.com/pxy2/virtuals?competition_id=4&tab=&period=2026-11-27+13:28:00&sub_type_id=GG&level=4&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+results - https://odibets.com/pxy2/virtuals?competition_id=4&tab=results&period=2026-11-27+13:30:00&level=2&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+
+english league
+selector - 
+https://odibets.com/pxy2/virtuals?competition_id=1&tab=&period=&level=1&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+matches - https://odibets.com/pxy2/virtuals?competition_id=1&tab=&period=2026-11-27+13:32:00&level=3&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+markets - https://odibets.com/pxy2/virtuals?competition_id=1&tab=&period=2026-11-27+13:32:00&sub_type_id=GG&level=4&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
+results - https://odibets.com/pxy2/virtuals?competition_id=1&tab=results&period=2026-11-27+13:32:00&level=2&platform=desktop&view=odileague&ua=Mozilla%2F5.0+(Windows+NT+10.0%3B+Win64%3B+x64)+AppleWebKit%2F537.36+(KHTML,+like+Gecko)+Chrome%2F158.0.0.0+Safari%2F537.36&resource=virtuals
