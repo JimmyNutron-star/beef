@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import csv
+import io
 import sqlite3
 from pathlib import Path
 
@@ -24,6 +25,16 @@ HERE = Path(__file__).resolve().parent
 SCHEMA_PATH = HERE / "schema.sql"
 
 COMPETITIONS = {1: "English", 2: "Spanish", 3: "Kenyan", 4: "Italian"}
+ODDS_FIELDS = (
+    "scraped_at", "round_start", "round_id", "competition_id",
+    "home", "away", "market", "selection", "odd",
+)
+RESULT_FIELDS = (
+    "parent_match_id", "round_id", "season_id", "start_time", "end_time",
+    "home_team", "away_team", "home_id", "away_id", "h_img", "a_img",
+    "result", "ht_score", "scoring_time", "previous_score", "status", "rid",
+    "competition_id",
+)
 
 # ------------------------------------------------------------------ schema
 SCHEMA_SQL = """\
@@ -96,6 +107,13 @@ CREATE TABLE IF NOT EXISTS odd_snapshot (
     UNIQUE(match_id, market_id, selection, scraped_at)
 );
 
+CREATE TABLE IF NOT EXISTS import_state (
+    path TEXT PRIMARY KEY,
+    byte_offset INTEGER NOT NULL,
+    inode INTEGER,
+    mtime_ns INTEGER
+);
+
 -- ------------------------------------------------------------------ staging
 CREATE TABLE IF NOT EXISTS staging_odds_raw (
     scraped_at       TEXT,
@@ -161,6 +179,10 @@ def get_conn(db_path: Path):
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -16000")
+    conn.execute("PRAGMA mmap_size = 33554432")
     return conn
 
 
@@ -296,6 +318,72 @@ def ensure_market(conn, name):
 
 
 # ------------------------------------------------------------------ discover
+def _get_import_state(conn, path: Path):
+    key = str(path.resolve())
+    row = conn.execute(
+        "SELECT byte_offset, inode, mtime_ns "
+        "FROM import_state WHERE path = ?",
+        (key,),
+    ).fetchone()
+    return row
+
+
+def _set_import_state(conn, path: Path, byte_offset, stat):
+    conn.execute(
+        "INSERT INTO import_state(path, byte_offset, inode, mtime_ns) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(path) DO UPDATE SET "
+        "byte_offset=excluded.byte_offset, inode=excluded.inode, "
+        "mtime_ns=excluded.mtime_ns",
+        (
+            str(path.resolve()),
+            byte_offset,
+            getattr(stat, "st_ino", None),
+            getattr(stat, "st_mtime_ns", None),
+        ),
+    )
+
+
+def _read_csv_delta(conn, path: Path, fields):
+    if not path.exists():
+        return [], 0, False
+
+    stat = path.stat()
+    state = _get_import_state(conn, path)
+    inode = getattr(stat, "st_ino", None)
+    full = (
+        state is None
+        or state[1] is not None and inode is not None and state[1] != inode
+        or stat.st_size < state[0]
+    )
+
+    if full:
+        with open(path, "rb") as f:
+            data = f.read()
+        newline = data.rfind(b"\n")
+        complete_size = newline + 1 if newline >= 0 else 0
+        if complete_size == 0:
+            return [], 0, True
+        text = data[:complete_size].decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        return list(reader), complete_size, True
+
+    offset = state[0]
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+
+    newline = data.rfind(b"\n")
+    if newline < 0:
+        return [], offset, False
+
+    complete = data[:newline + 1]
+    text = complete.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text, newline=""), fieldnames=fields)
+    rows = list(reader)
+    return rows, offset + len(complete), False
+
+
 def discover_files(prefix):
     """Return legacy <prefix>.csv plus <prefix>_<n>.csv."""
     files = []
@@ -312,64 +400,83 @@ def import_results(conn, path: Path):
     if not path.exists():
         print(f"  {path.name}: missing, skipping")
         return 0
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    rows, byte_offset, full = _read_csv_delta(conn, path, RESULT_FIELDS)
     print(f"  {path.name}: {len(rows)} rows")
 
+    stage_tuples = [
+        (
+            r.get("parent_match_id"), r.get("round_id"), r.get("season_id"),
+            r.get("start_time"), r.get("end_time"),
+            r.get("home_team"), r.get("away_team"),
+            r.get("home_id"), r.get("away_id"),
+            r.get("h_img"), r.get("a_img"),
+            r.get("result"), r.get("ht_score"), r.get("scoring_time"),
+            r.get("previous_score"), r.get("status"), r.get("rid"),
+            _to_int(r.get("competition_id")) or 1,
+        )
+        for r in rows
+    ]
+
     inserted = 0
-    with conn:
-        for r in rows:
-            cid = _to_int(r.get("competition_id")) or 1
-
-            conn.execute(
-                "INSERT INTO staging_results_raw "
-                "(parent_match_id, round_id, season_id, start_time, end_time, "
-                " home_team, away_team, home_id, away_id, h_img, a_img, "
-                " result, ht_score, scoring_time, previous_score, status, rid, "
-                " competition_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    r.get("parent_match_id"), r.get("round_id"),
-                    r.get("season_id"), r.get("start_time"), r.get("end_time"),
-                    r.get("home_team"), r.get("away_team"),
-                    r.get("home_id"), r.get("away_id"),
-                    r.get("h_img"), r.get("a_img"),
-                    r.get("result"), r.get("ht_score"), r.get("scoring_time"),
-                    r.get("previous_score"), r.get("status"), r.get("rid"),
-                    cid,
-                ),
-            )
-
-            start = r.get("start_time")
-            if not start:
-                continue
-            ensure_competition(conn, cid)
-            ensure_season(conn, _to_int(r.get("season_id")), cid)
-
-            round_key = ensure_round(conn, cid, start, r.get("end_time"))
-
-            hid = ensure_team(conn, cid, r.get("home_team"), r.get("h_img"))
-            aid = ensure_team(conn, cid, r.get("away_team"), r.get("a_img"))
-            if hid is None or aid is None:
-                continue
-
-            mid = ensure_match(
-                conn, round_key, hid, aid,
-                season_id=_to_int(r.get("season_id")),
-                parent_match_id=r.get("parent_match_id"),
-                start_time=start,
-                end_time=r.get("end_time"),
-                status=r.get("status"),
-                rid=r.get("rid"),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO match_result "
-                "(match_id, result, ht_score, scoring_time, previous_score) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (mid, r.get("result"), r.get("ht_score"),
-                 r.get("scoring_time"), r.get("previous_score")),
-            )
-            inserted += 1
+    try:
+        with conn:
+            if full and not getattr(import_results, "_staging_cleared", False):
+                conn.execute("DELETE FROM staging_results_raw")
+                import_results._staging_cleared = True
+            if full:
+                conn.executemany(
+                    "INSERT INTO staging_results_raw "
+                    "(parent_match_id, round_id, season_id, start_time, end_time, "
+                    " home_team, away_team, home_id, away_id, h_img, a_img, "
+                    " result, ht_score, scoring_time, previous_score, status, rid, "
+                    " competition_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    stage_tuples,
+                )
+            else:
+                conn.executemany(
+                    "INSERT INTO staging_results_raw "
+                    "(parent_match_id, round_id, season_id, start_time, end_time, "
+                    " home_team, away_team, home_id, away_id, h_img, a_img, "
+                    " result, ht_score, scoring_time, previous_score, status, rid, "
+                    " competition_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    stage_tuples,
+                )
+            for r in rows:
+                cid = _to_int(r.get("competition_id")) or 1
+                start = r.get("start_time")
+                if not start:
+                    continue
+                ensure_competition(conn, cid)
+                ensure_season(conn, _to_int(r.get("season_id")), cid)
+                round_key = ensure_round(conn, cid, start, r.get("end_time"))
+                hid = ensure_team(conn, cid, r.get("home_team"), r.get("h_img"))
+                aid = ensure_team(conn, cid, r.get("away_team"), r.get("a_img"))
+                if hid is None or aid is None:
+                    continue
+                mid = ensure_match(
+                    conn, round_key, hid, aid,
+                    season_id=_to_int(r.get("season_id")),
+                    parent_match_id=r.get("parent_match_id"),
+                    start_time=start,
+                    end_time=r.get("end_time"),
+                    status=r.get("status"),
+                    rid=r.get("rid"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO match_result "
+                    "(match_id, result, ht_score, scoring_time, previous_score) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (mid, r.get("result"), r.get("ht_score"),
+                     r.get("scoring_time"), r.get("previous_score")),
+                )
+                inserted += 1
+            stat = path.stat()
+            _set_import_state(conn, path, byte_offset, stat)
+    except (OSError, sqlite3.Error, csv.Error, UnicodeError) as e:
+        print(f"  {path.name}: import failed: {e}")
+        return 0
     return inserted
 
 
@@ -378,59 +485,64 @@ def import_odds(conn, path: Path):
     if not path.exists():
         print(f"  {path.name}: missing, skipping")
         return 0
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    rows, byte_offset, full = _read_csv_delta(conn, path, ODDS_FIELDS)
     print(f"  {path.name}: {len(rows)} rows")
 
-    inserted = 0
-    with conn:
-        for r in rows:
-            cid = _to_int(r.get("competition_id")) or 1
+    stage_tuples = [
+        (
+            r.get("scraped_at"), r.get("round_start"),
+            r.get("round_id"), _to_int(r.get("competition_id")) or 1,
+            r.get("home"), r.get("away"),
+            r.get("market"), r.get("selection"), r.get("odd"),
+        )
+        for r in rows
+    ]
 
-            conn.execute(
+    inserted = 0
+    try:
+        with conn:
+            if full and not getattr(import_odds, "_staging_cleared", False):
+                conn.execute("DELETE FROM staging_odds_raw")
+                import_odds._staging_cleared = True
+            conn.executemany(
                 "INSERT INTO staging_odds_raw "
                 "(scraped_at, round_start, round_id, competition_id, "
                 " home, away, market, selection, odd) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    r.get("scraped_at"), r.get("round_start"),
-                    r.get("round_id"), cid,
-                    r.get("home"), r.get("away"),
-                    r.get("market"), r.get("selection"), r.get("odd"),
-                ),
+                stage_tuples,
             )
-
-            start = r.get("round_start")
-            if not start:
-                continue
-
-            ensure_competition(conn, cid)
-            round_key = ensure_round(conn, cid, start, None)
-
-            hid = ensure_team(conn, cid, r.get("home"))
-            aid = ensure_team(conn, cid, r.get("away"))
-            if hid is None or aid is None:
-                continue
-
-            mid = ensure_match(conn, round_key, hid, aid, start_time=start)
-
-            market_name = r.get("market")
-            if not market_name:
-                continue
-            mkid = ensure_market(conn, market_name)
-
-            try:
-                odd_val = float(r.get("odd"))
-            except (TypeError, ValueError):
-                continue
-
-            conn.execute(
-                "INSERT OR IGNORE INTO odd_snapshot "
-                "(match_id, market_id, selection, odd, scraped_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (mid, mkid, r.get("selection"), odd_val, r.get("scraped_at")),
-            )
-            inserted += 1
+            for r in rows:
+                cid = _to_int(r.get("competition_id")) or 1
+                start = r.get("round_start")
+                if not start:
+                    continue
+                ensure_competition(conn, cid)
+                round_key = ensure_round(conn, cid, start, None)
+                hid = ensure_team(conn, cid, r.get("home"))
+                aid = ensure_team(conn, cid, r.get("away"))
+                if hid is None or aid is None:
+                    continue
+                mid = ensure_match(conn, round_key, hid, aid, start_time=start)
+                market_name = r.get("market")
+                if not market_name:
+                    continue
+                mkid = ensure_market(conn, market_name)
+                try:
+                    odd_val = float(r.get("odd"))
+                except (TypeError, ValueError):
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO odd_snapshot "
+                    "(match_id, market_id, selection, odd, scraped_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (mid, mkid, r.get("selection"), odd_val, r.get("scraped_at")),
+                )
+                inserted += 1
+            stat = path.stat()
+            _set_import_state(conn, path, byte_offset, stat)
+    except (OSError, sqlite3.Error, csv.Error, UnicodeError) as e:
+        print(f"  {path.name}: import failed: {e}")
+        return 0
     return inserted
 
 
@@ -468,10 +580,11 @@ def build(db_path: Path, keep: bool):
     _round_cache.clear()
     _team_cache.clear()
     _match_cache.clear()
+    import_odds._staging_cleared = False
+    import_results._staging_cleared = False
 
     conn = get_conn(db_path)
-    with conn:
-        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
 
     res_files  = discover_files("results")
     odds_files = discover_files("odds")
@@ -506,7 +619,7 @@ def build(db_path: Path, keep: bool):
 
     conn.close()
 
-    print(f"\n✅ built {db_path}")
+    print(f"\nbuilt {db_path}")
     print(f"   results rows  : {n_res}")
     print(f"   odds rows     : {n_odd}")
     print(f"   matches w/odds     : {with_odds}")
@@ -515,6 +628,11 @@ def build(db_path: Path, keep: bool):
     print("   table counts :")
     for t, n in counts.items():
         print(f"     {t:<22} {n:>8}")
+    if n_res and n_odd and joined == 0:
+        print("\nWARNING: results and odds imported but 0 matches joined!")
+        print("   Check that results.start_time == odds.round_start exactly.")
+        print("   Run: SELECT DISTINCT round_start FROM round LIMIT 5;")
+        print("        SELECT DISTINCT start_time FROM match LIMIT 5;")
 
 
 # ------------------------------------------------------------------ main
@@ -532,7 +650,7 @@ def main():
 
     if args.schema_only:
         write_schema(force=args.force_schema)
-        print(f"\n✅ schema written to {SCHEMA_PATH}")
+        print(f"\nschema written to {SCHEMA_PATH}")
         return
 
     build(args.db, args.keep)

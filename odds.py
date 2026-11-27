@@ -13,6 +13,7 @@ Writes  odds_<cid>.csv  by default.
 import argparse
 import csv
 import os
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,13 +43,15 @@ COMPETITIONS = {1: "English", 2: "Spanish", 3: "Kenyan", 4: "Italian"}
 
 _tls = threading.local()
 _stop_event = threading.Event()
+_tls_session = threading.local()
 
 
-def _set_league(cid: int, csv_path: str, quiet: bool = False):
+def _set_league(cid: int, csv_path: str, quiet: bool = False, timeout: int = 20):
     _tls.competition_id = cid
     _tls.csv_path = csv_path
     _tls.quiet = quiet
     _tls.tag = f"[L{cid}] " if quiet else ""
+    _tls.timeout = timeout
 
 
 def _cid() -> int:
@@ -67,7 +70,7 @@ def _tag() -> str:
     return getattr(_tls, "tag", "")
 
 
-SUB_TYPES = [
+SUB_TYPES_FULL = [
     "1X2", "GG", "DC",
     "TG15", "TG25", "TG35",
     "1X2OU15", "1X2OU25", "1X2OU35", "1X2OU45", "1X2OU55",
@@ -76,6 +79,17 @@ SUB_TYPES = [
     "T1G", "T1OU15", "T2G", "T2OU15",
     "TFG", "TG", "TGOE",
 ]
+
+SUB_TYPES_MOBILE = [
+    "1X2", "GG", "DC", "TG15", "TG25", "TG35",
+    "1X2OU25", "H1X2", "CS",
+]
+PROFILES = {
+    "full":   {"workers": 5, "markets": SUB_TYPES_FULL,   "timeout": 20},
+    "mobile": {"workers": 2, "markets": SUB_TYPES_MOBILE, "timeout": 10},
+    "low":    {"workers": 1, "markets": SUB_TYPES_MOBILE, "timeout": 10},
+}
+SUB_TYPES = SUB_TYPES_FULL
 
 CSV_FIELDS = [
     "scraped_at", "round_start", "round_id", "competition_id",
@@ -130,11 +144,11 @@ def fmt_hms(seconds):
 
 # ================================================================ display
 class Display:
-    def __init__(self, width=130, tag="", quiet=False):
+    def __init__(self, width=None, tag="", quiet=False):
         self.lock = threading.RLock()
         self.timer = ""
         self.progress = ""
-        self.width = width
+        self.width = width or shutil.get_terminal_size((80, 24)).columns
         self.tag = f"[{tag}] " if tag else ""
         self.quiet = quiet
 
@@ -186,6 +200,24 @@ class Display:
                 print("\033[2K\r", end="", flush=True)
 
 # ================================================================ HTTP
+def _get_session() -> requests.Session:
+    if not hasattr(_tls_session, "session"):
+        s = requests.Session()
+        retry = requests.adapters.Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=retry,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _tls_session.session = s
+    return _tls_session.session
+
+
 def fetch_raw(period, sub_type, level, competition_id):
     params = {
         "competition_id": str(competition_id),
@@ -199,7 +231,10 @@ def fetch_raw(period, sub_type, level, competition_id):
         "resource": "virtuals",
     }
     t0 = time.perf_counter()
-    r = requests.get(BASE, params=params, headers=HEADERS, timeout=20)
+    r = _get_session().get(
+        BASE, params=params, headers=HEADERS,
+        timeout=getattr(_tls, "timeout", 10),
+    )
     elapsed = time.perf_counter() - t0
     r.raise_for_status()
     return r.json(), elapsed
@@ -214,8 +249,11 @@ def scrape_one(period, sub_type, level, competition_id):
 
 def merge_matches(results, matches):
     for m in matches:
-        key = (m.get("home_team") or m.get("home"),
-               m.get("away_team") or m.get("away"))
+        home = m.get("home_team") or m.get("home")
+        away = m.get("away_team") or m.get("away")
+        if not home or not away:
+            continue
+        key = (home, away)
         for mk in m.get("markets", []):
             mname = mk.get("odd_type") or mk.get("sub_type_id") or "?"
             dst = results.setdefault(key, {}).setdefault(mname, {})
@@ -264,8 +302,9 @@ def scrape_with_retries(period, level, workers, competition_id,
     return last
 
 
-def acquire_periods(level, tz, competition_id, max_probe=240):
+def acquire_periods(level, tz, competition_id, max_probe=60):
     base = now_in(tz).replace(second=0, microsecond=0)
+    failures = 0
     for offset in range(0, max_probe + 1):
         if _stop_event.is_set():
             return []
@@ -273,12 +312,19 @@ def acquire_periods(level, tz, competition_id, max_probe=240):
         period = ts.strftime("%Y-%m-%d %H:%M:%S")
         try:
             data, _ = fetch_raw(period, "1X2", level, competition_id)
+            failures = 0
         except (requests.RequestException, ValueError):
+            failures += 1
+            if failures >= 3:
+                if _stop_event.wait(min(30, 2 * failures)):
+                    return []
             continue
         d = data.get("data", data)
         periods = d.get("periods") if isinstance(d, dict) else None
         if periods:
             return periods
+        if _stop_event.wait(0.4):
+            return []
     return []
 
 # ================================================================ CSV
@@ -367,7 +413,8 @@ def scrape_worker(rounds, target_s, level, workers, tz, csv_path,
                     f"📊 waiting for target window "
                     f"({secs - WINDOW_LEAD:.0f}s, {i}/{total})"
                 )
-                time.sleep(min(5, max(1, secs - WINDOW_LEAD)))
+                sleep_for = min(5.0, max(1.0, (secs - WINDOW_LEAD) / 4))
+                time.sleep(sleep_for)
 
         marker = " ⭐" if is_target else ""
         display.set_progress(
@@ -405,7 +452,7 @@ def run_single(args):
     csv_path = args.csv or f"odds_{cid}.csv"
     quiet    = getattr(args, "quiet", False)
 
-    _set_league(cid, csv_path, quiet=quiet)
+    _set_league(cid, csv_path, quiet=quiet, timeout=getattr(args, "timeout", 20))
     csv_path = _csv_path()
 
     display   = Display(
@@ -492,6 +539,8 @@ def run_single(args):
                         _stop_event.wait(0.5)
                     display.set_timer("")
                     display.finish()
+                if _stop_event.wait(5):
+                    break
                 continue
 
             # pick nearest UPCOMING round as target (fix: upcoming[0])
@@ -547,6 +596,18 @@ def run_single(args):
         print(f"{_tag()}file: {csv_path}")
 
 # ================================================================ all mode
+def _safe_run(args):
+    try:
+        run_single(args)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(
+            f"[L{args.competition}] thread crashed: {e}",
+            flush=True,
+        )
+
+
 def run_all(args):
     """Run all 4 leagues concurrently as threads in one process."""
     _stop_event.clear()
@@ -554,7 +615,7 @@ def run_all(args):
 
     for cid in COMPETITIONS:
         t = threading.Thread(
-            target=run_single,
+            target=_safe_run,
             args=(argparse.Namespace(
                 competition=cid,
                 csv=None,
@@ -563,6 +624,7 @@ def run_all(args):
                 tz=args.tz,
                 rounds=args.rounds,
                 quiet=True,
+                timeout=args.timeout,
             ),),
             name=f"odds-league-{cid}",
             daemon=False,
@@ -588,11 +650,20 @@ def main():
     ap.add_argument("--csv", default=None,
                     help="output csv (default: odds_<cid>.csv)")
     ap.add_argument("--level", type=int, default=4)
-    ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--profile", choices=list(PROFILES), default="full")
     ap.add_argument("--tz", default="Africa/Nairobi")
     ap.add_argument("--rounds", type=int, default=0,
                     help="stop after N monitor cycles (0 = infinite)")
     args = ap.parse_args()
+
+    global SUB_TYPES
+    profile = PROFILES[args.profile]
+    SUB_TYPES = profile["markets"]
+    if args.workers is None or args.workers == 5:
+        args.workers = profile["workers"]
+    args.workers = args.workers or profile["workers"]
+    args.timeout = profile["timeout"]
 
     if args.competition == "all":
         run_all(args)

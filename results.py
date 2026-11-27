@@ -158,26 +158,23 @@ def _log(*args, **kwargs):
     if not prefix:
         print(*args, **kwargs)
         return
-
-    sep = kwargs.get("sep", " ")
-    end = kwargs.get("end", "\n")
-    file = kwargs.get("file")
-    flush = kwargs.get("flush", False)
-    message = sep.join(str(arg) for arg in args)
-    lines = message.splitlines() or [""]
-    print(
-        "\n".join(f"{prefix} {line}" for line in lines),
-        end=end,
-        file=file,
-        flush=flush,
-    )
+    allowed = {k: v for k, v in kwargs.items() if k in ("file", "flush", "end")}
+    msg = " ".join(str(a) for a in args)
+    print(f"{prefix} {msg}", **allowed)
 
 
 def get_session():
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
+        retry = requests.adapters.Retry(
+            total=3,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS,
+            max_retries=retry,
         )
         s.mount("https://", adapter)
         s.mount("http://", adapter)
@@ -224,7 +221,9 @@ def fetch_json(session, period, level, tab, label=""):
 def parse_matches(payload):
     if not payload:
         return []
-    data = payload.get("data") or {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
     ht = {
         str(h.get("ParentMatchID")): h
         for h in data.get("half_time") or []
@@ -270,7 +269,9 @@ def load_csv():
                 if key:
                     matches[key] = row
                 st = row.get("start_time")
-                if st:
+                status = str(row.get("status") or "").strip().lower()
+                if st and status in {"ft", "finished", "final", "ended",
+                                     "complete", "completed"}:
                     done_rounds.add(st)
     except Exception as e:
         _log(f"⚠️  {csv_path} unreadable ({e}); starting fresh")
@@ -278,7 +279,7 @@ def load_csv():
     return matches, done_rounds
 
 
-def write_csv(matches):
+def write_csv_compact(matches):
     csv_path = _out_csv()
     rows = sorted(matches.values(), key=sort_key)
     tmp = csv_path.with_suffix(".csv.tmp")
@@ -287,6 +288,18 @@ def write_csv(matches):
         w.writeheader()
         w.writerows(rows)
     tmp.replace(csv_path)
+
+
+def append_csv_rows(new_rows):
+    if not new_rows:
+        return
+    csv_path = _out_csv()
+    is_new = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        if is_new:
+            w.writeheader()
+        w.writerows(sorted(new_rows, key=sort_key))
 
 # ------------------------------------------------------------------ worker
 def worker(rnd):
@@ -390,7 +403,8 @@ def _wait_until_end(session):
                 pad = max(0, width - len(line))
                 print(f"\r{line}{' ' * pad}", end="", flush=True)
                 width = len(line)
-            if _stop_event.wait(1):
+            sleep_for = min(10.0, max(1.0, delta / 8))
+            if _stop_event.wait(sleep_for):
                 return "stopped"
     finally:
         if width:
@@ -458,11 +472,26 @@ def run_cycle(matches, done_rounds, attempts, skipped):
 
     if payload is None:
         print(f"{_tag()}  ⚠️  phase 1 failed ({p1:.1f}s)")
-        return 0
+        return 0, []
 
     data = payload.get("data") or {}
     seen = set()
     rounds = []
+    period_match_counts = {}
+    for item in data.get("matches") or []:
+        item_start = item.get("start_time")
+        if item_start:
+            period_match_counts[item_start] = period_match_counts.get(item_start, 0) + 1
+    for period in data.get("periods") or []:
+        period_start = period.get("start_time") or period.get("period")
+        if period_start:
+            count = (period.get("match_count") or period.get("matches_count")
+                     or period.get("matchCount"))
+            if count is not None:
+                try:
+                    period_match_counts[period_start] = int(count)
+                except (TypeError, ValueError):
+                    pass
 
     def _collect(items):
         for it in items or []:
@@ -473,6 +502,7 @@ def run_cycle(matches, done_rounds, attempts, skipped):
                     "round_id":   it.get("round_id"),
                     "start_time": st,
                     "end_time":   it.get("end_time"),
+                    "match_count": period_match_counts.get(st),
                 })
 
     _collect(data.get("results"))
@@ -484,7 +514,7 @@ def run_cycle(matches, done_rounds, attempts, skipped):
             print(f"{_tag()}  [debug] recovered {len(rounds)} rounds from data.matches")
 
     if not rounds:
-        return 0
+        return 0, []
 
     new_rounds = [
         r for r in rounds
@@ -494,13 +524,14 @@ def run_cycle(matches, done_rounds, attempts, skipped):
 
     if not new_rounds:
         print(f"{_tag()}  {len(rounds)} rounds seen, 0 new  (phase 1: {p1:.1f}s)")
-        return 0
+        return 0, []
 
     print(f"{_tag()}  {len(rounds)} rounds seen, {len(new_rounds)} to fetch  "
           f"(phase 1: {p1:.1f}s)")
 
     t0 = time.perf_counter()
     added = 0
+    new_rows = []
     league_state = (_cid(), _out_csv(), _quiet())
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS,
@@ -518,11 +549,37 @@ def run_cycle(matches, done_rounds, attempts, skipped):
                     if key and key not in matches:
                         matches[key] = m
                         new_here += 1
-                done_rounds.add(st)
-                attempts.pop(st, None)
+                        new_rows.append(m)
                 added += new_here
-                print(f"{_tag()}    round {rnd['round_id']:<5} {st}  "
-                      f"{dt*1000:>5.0f}ms  +{new_here:>3} new")
+                end_dt = _parse_dt(rnd["end_time"])
+                now = _now()
+                final_status = any(
+                    str(m.get("status") or "").strip().lower()
+                    in {"ft", "finished", "final", "ended", "complete", "completed"}
+                    for m in ms
+                )
+                after_end_buffer = (
+                    end_dt is not None
+                    and now >= end_dt + timedelta(seconds=ROUND_END_BUFFER_SECONDS)
+                )
+                match_count = rnd.get("match_count")
+                count_matches = (
+                    match_count is None
+                    or len(ms) == match_count
+                )
+                if end_dt is not None and end_dt <= now and final_status:
+                    done_rounds.add(st)
+                    attempts.pop(st, None)
+                    print(f"{_tag()}    round {rnd['round_id']:<5} {st}  "
+                          f"{dt*1000:>5.0f}ms  +{new_here:>3} new")
+                elif after_end_buffer and count_matches:
+                    done_rounds.add(st)
+                    attempts.pop(st, None)
+                    print(f"{_tag()}    round {rnd['round_id']:<5} {st}  "
+                          f"{dt*1000:>5.0f}ms  +{new_here:>3} new")
+                else:
+                    print(f"{_tag()}    round {rnd['round_id']:<5} {st}  "
+                          f"+{new_here} new (deferred — round not final)")
             else:
                 n = attempts.get(st, 0) + 1
                 attempts[st] = n
@@ -538,20 +595,21 @@ def run_cycle(matches, done_rounds, attempts, skipped):
 
     if added == 0:
         print(f"{_tag()}  phase 2: no new matches  ({p2:.1f}s)")
-    return added
+    return added, new_rows
 
 
 def do_cycle(matches, done_rounds, attempts, skipped):
     t0 = time.perf_counter()
     try:
-        added = run_cycle(matches, done_rounds, attempts, skipped)
+        added, new_rows = run_cycle(matches, done_rounds, attempts, skipped)
     except Exception as e:
         print(f"{_tag()}  ❌ cycle error: {e}")
         added = 0
+        new_rows = []
     elapsed = time.perf_counter() - t0
     if added > 0:
         try:
-            write_csv(matches)
+            append_csv_rows(new_rows)
             print(f"{_tag()}  ✅ +{added} new (total {len(matches)})  "
                   f"cycle {elapsed:.1f}s  → {_out_csv()}")
         except Exception as e:
@@ -605,7 +663,7 @@ def run_single(args):
         _log("\n⏹  Ctrl+C — saving final snapshot...")
     finally:
         try:
-            write_csv(matches)
+            write_csv_compact(matches)
         except Exception as e:
             _log(f"  ⚠️  save error: {e}")
         _log(f"   Matches : {len(matches)}")
