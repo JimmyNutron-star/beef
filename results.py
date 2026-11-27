@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 """
-odibets_enricher.py — poll driven by real API round timestamps.
+odibets_enricher.py — match metadata scraper (multi-league).
 
-Fix:
-  * data.periods is empty in every sample response, so probing future
-    periods (level=3) is the only way to learn the next round's actual
-    start_time / end_time.  The probe uses those returned values directly
-    (no prediction).
-  * Display never shows a past round — always the next future round
-    closest to now.  If nothing is found yet, shows "searching…" and
-    re-probes every 10 s.
+Usage:
+    uv run odibets_enricher.py --competition 1
+    uv run odibets_enricher.py --competition all
+
+Writes  results_<cid>.csv  by default.
 """
 
+import argparse
 import csv
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
+
 # ------------------------------------------------------------------ config
-BASE_URL  = "https://odibets.com/pxy2/virtuals"
-UA_STRING = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/156.0.0.0 Safari/537.36"
-)
+BASE_URL = "https://odibets.com/pxy2/virtuals"
+UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/158.0.0.0 Safari/537.36")
 HEADERS = {
     "User-Agent": UA_STRING,
     "Accept": "application/json, text/plain, */*",
@@ -37,22 +39,21 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-COMPETITION_ID     = 1
+COMPETITIONS = {1: "English", 2: "Spanish", 3: "Kenyan", 4: "Italian"}
+
 MAX_WORKERS        = 8
 TIMEOUT            = 20
 RETRIES            = 2
 RETRY_BACKOFF      = 1.0
 CYCLE_INTERVAL     = 30
 MAX_ROUND_ATTEMPTS = 3
-
-ROUND_DURATION_SECONDS   = 35
 ROUND_END_BUFFER_SECONDS = 3
-PROBE_REFRESH_INTERVAL   = 10   # re-probe every 10s in fallback mode
+PROBE_REFRESH_INTERVAL   = 10
+PROBE_OFFSETS_SEC        = [0, 30, 60, 90, 120, 180, 300]
+TZ_NAME = "Africa/Nairobi"
 
-# Probe at these offsets from now; first hit wins (closest future round).
-PROBE_OFFSETS_SEC = [0, 30, 60, 90, 120, 180, 300]
-
-OUT_CSV = Path("results.csv")
+_tls = threading.local()
+_stop_event = threading.Event()
 
 FIELDS = [
     "parent_match_id", "round_id", "season_id",
@@ -65,9 +66,40 @@ FIELDS = [
     "rid", "competition_id",
 ]
 
+# ------------------------------------------------------------------ time
+_FIXED_OFFSET_HOURS = {"Africa/Nairobi": 3, "UTC": 0}
+
+
+def _resolve_tz(tz):
+    if not tz:
+        return None
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, KeyError, OSError):
+            pass
+    hours = _FIXED_OFFSET_HOURS.get(tz)
+    return timezone(timedelta(hours=hours)) if hours is not None else None
+
+
+_TZ = _resolve_tz(TZ_NAME)
+
+
+def _now():
+    return datetime.now(_TZ) if _TZ else datetime.now()
+
+
+def _parse_dt(s):
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=_TZ) if _TZ else dt
+    except (TypeError, ValueError):
+        return None
+
 # ------------------------------------------------------------------ utils
 def fmt_now():
-    return datetime.now().strftime("%H:%M:%S")
+    return _now().strftime("%H:%M:%S")
+
 
 def sort_key(row):
     st = row.get("start_time") or ""
@@ -78,7 +110,68 @@ def sort_key(row):
         rid = 0
     return (st, rid)
 
+
+def _fmt_secs(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s" if m else f"{s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+# ------------------------------------------------------------------ session
 _thread_local = threading.local()
+
+
+def _set_league(cid, out_csv, quiet=False):
+    _tls.cid = cid
+    _tls.out_csv = Path(out_csv)
+    _tls.quiet = quiet
+    _tls.tag = f"[L{cid}]" if quiet else ""
+    _tls.round_timer = {"next_start": None, "next_end": None}
+
+
+def _cid():
+    return getattr(_tls, "cid", 1)
+
+
+def _out_csv():
+    return getattr(_tls, "out_csv", Path("results.csv"))
+
+
+def _quiet():
+    return getattr(_tls, "quiet", False)
+
+
+def _tag():
+    return getattr(_tls, "tag", "")
+
+
+def _rtimer():
+    if not hasattr(_tls, "round_timer"):
+        _tls.round_timer = {"next_start": None, "next_end": None}
+    return _tls.round_timer
+
+
+def _log(*args, **kwargs):
+    prefix = _tag()
+    if not prefix:
+        print(*args, **kwargs)
+        return
+
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    file = kwargs.get("file")
+    flush = kwargs.get("flush", False)
+    message = sep.join(str(arg) for arg in args)
+    lines = message.splitlines() or [""]
+    print(
+        "\n".join(f"{prefix} {line}" for line in lines),
+        end=end,
+        file=file,
+        flush=flush,
+    )
+
 
 def get_session():
     if not hasattr(_thread_local, "session"):
@@ -94,7 +187,7 @@ def get_session():
 # ------------------------------------------------------------------ http
 def build_params(period, level, tab):
     return {
-        "competition_id": COMPETITION_ID,
+        "competition_id": str(_cid()),
         "tab": tab,
         "period": period,
         "level": level,
@@ -104,33 +197,30 @@ def build_params(period, level, tab):
         "resource": "virtuals",
     }
 
+
 def fetch_json(session, period, level, tab, label=""):
     params = build_params(period, level, tab)
     for attempt in range(1, RETRIES + 1):
         t0 = time.perf_counter()
         try:
-            r = session.get(BASE_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
+            r = session.get(BASE_URL, params=params, headers=HEADERS,
+                            timeout=TIMEOUT)
             r.raise_for_status()
             return r.json()
         except (requests.RequestException, ValueError) as e:
             dt = time.perf_counter() - t0
             if attempt == RETRIES:
                 if label:
-                    print(f"    {label} FAILED after {dt:.2f}s: {e}", flush=True)
+                    _log(f"    {label} FAILED after {dt:.2f}s: {e}",
+                         flush=True)
                 return None
             if label:
-                print(f"    {label} attempt {attempt} failed ({dt:.2f}s): {e} → retry",
-                      flush=True)
+                _log(f"    {label} attempt {attempt} failed "
+                     f"({dt:.2f}s): {e} → retry", flush=True)
             time.sleep(RETRY_BACKOFF * attempt)
     return None
 
 # ------------------------------------------------------------------ parsing
-def _parse_dt(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return None
-
 def parse_matches(payload):
     if not payload:
         return []
@@ -162,18 +252,19 @@ def parse_matches(payload):
             "previous_score":  m.get("previous_score"),
             "status":          m.get("status"),
             "rid":             m.get("rid"),
-            "competition_id":  m.get("competition_id"),
+            "competition_id":  m.get("competition_id") or _cid(),
         })
     return out
 
-# ------------------------------------------------------------------ CSV I/O
+# ------------------------------------------------------------------ csv
 def load_csv():
     matches = {}
     done_rounds = set()
-    if not OUT_CSV.exists():
+    csv_path = _out_csv()
+    if not csv_path.exists():
         return matches, done_rounds
     try:
-        with open(OUT_CSV, newline="", encoding="utf-8") as f:
+        with open(csv_path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 key = row.get("parent_match_id")
                 if key:
@@ -182,18 +273,20 @@ def load_csv():
                 if st:
                     done_rounds.add(st)
     except Exception as e:
-        print(f"⚠️  results.csv unreadable ({e}); starting fresh")
+        _log(f"⚠️  {csv_path} unreadable ({e}); starting fresh")
         return {}, set()
     return matches, done_rounds
 
+
 def write_csv(matches):
+    csv_path = _out_csv()
     rows = sorted(matches.values(), key=sort_key)
-    tmp = OUT_CSV.with_suffix(".csv.tmp")
+    tmp = csv_path.with_suffix(".csv.tmp")
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    tmp.replace(OUT_CSV)
+    tmp.replace(csv_path)
 
 # ------------------------------------------------------------------ worker
 def worker(rnd):
@@ -206,35 +299,24 @@ def worker(rnd):
         return rnd, [], dt, False
     return rnd, parse_matches(payload), dt, True
 
-# ------------------------------------------------------------------ timer state
-_round_timer = {
-    "next_start": None,
-    "next_end":   None,
-}
-
 def _promote_expired_next(now):
-    """If the watched round has passed its end, clear it so we re-probe."""
-    ne = _round_timer["next_end"]
+    timer = _rtimer()
+    ne = timer["next_end"]
     if ne is not None and now >= ne:
-        _round_timer["next_start"] = None
-        _round_timer["next_end"]   = None
+        timer["next_start"] = None
+        timer["next_end"] = None
+
 
 def find_next_round(session, now):
-    """
-    Probe level=3 at increasing future offsets, take the FIRST round
-    whose end_time is still in the future.  Returns (start_dt, end_dt).
-    Uses only real timestamps returned by the API.
-    """
     for offset in PROBE_OFFSETS_SEC:
-        probe_str = (now + timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
+        probe_str = (now + timedelta(seconds=offset)).strftime(
+            "%Y-%m-%d %H:%M:%S")
         payload = fetch_json(session, probe_str, level=3, tab="")
         if not payload:
             continue
         data = payload.get("data") or {}
-
         best = None
 
-        # Periods list (usually empty, but check anyway)
         for p in data.get("periods") or []:
             st, et = p.get("start_time"), p.get("end_time")
             if not st or not et:
@@ -244,13 +326,11 @@ def find_next_round(session, now):
                 if best is None or dt_s < best[0]:
                     best = (dt_s, dt_e)
 
-        # Matches (the reliable path)
         for m in data.get("matches") or []:
             st, et = m.get("start_time"), m.get("end_time")
             if not st or not et:
                 continue
-            dt_s = _parse_dt(st)
-            dt_e = _parse_dt(et)
+            dt_s, dt_e = _parse_dt(st), _parse_dt(et)
             if dt_s and dt_e and dt_e > now:
                 if best is None or dt_s < best[0]:
                     best = (dt_s, dt_e)
@@ -260,95 +340,110 @@ def find_next_round(session, now):
 
     return None, None
 
+
 def refresh_next_round(session, now=None, force=False):
-    now = now or datetime.now()
+    now = now or _now()
     _promote_expired_next(now)
-    if _round_timer["next_end"] is not None and not force:
+    timer = _rtimer()
+    if timer["next_end"] is not None and not force:
         return
     ns, ne = find_next_round(session, now)
     if ns is not None:
-        _round_timer["next_start"] = ns
-        _round_timer["next_end"]   = ne
+        timer["next_start"] = ns
+        timer["next_end"] = ne
 
-def _fmt_secs(seconds):
-    seconds = max(0, int(seconds))
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"{m}m {s:02d}s" if m else f"{s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m:02d}m"
-
-# ------------------------------------------------------------------ waiting
+# ------------------------------------------------------------------ wait
 def _wait_until_end(session):
-    """Sleep until the watched round's end_time + buffer. Returns trigger."""
     width = 0
     try:
         while True:
-            now = datetime.now()
-            ns = _round_timer["next_start"]
-            ne = _round_timer["next_end"]
+            if _stop_event.is_set():
+                return "stopped"
+            now = _now()
+            timer = _rtimer()
+            ns = timer["next_start"]
+            ne = timer["next_end"]
 
             if ns is None or ne is None:
                 return "lost"
 
             target = ne + timedelta(seconds=ROUND_END_BUFFER_SECONDS)
-            delta  = (target - now).total_seconds()
+            delta = (target - now).total_seconds()
             if delta <= 0:
                 return "ended"
 
             if now >= ne:
-                line = (f"  ⏳ round {ns.strftime('%H:%M:%S')}–{ne.strftime('%H:%M:%S')} "
-                        f"finished, polling in {_fmt_secs(delta)}")
+                line = (f"  ⏳ round {ns.strftime('%H:%M:%S')}–"
+                        f"{ne.strftime('%H:%M:%S')} finished, "
+                        f"polling in {_fmt_secs(delta)}")
             elif now >= ns:
-                line = (f"  ⏳ 🔴 LIVE {ns.strftime('%H:%M:%S')}–{ne.strftime('%H:%M:%S')} "
+                line = (f"  ⏳ 🔴 LIVE {ns.strftime('%H:%M:%S')}–"
+                        f"{ne.strftime('%H:%M:%S')} "
                         f"({_fmt_secs((ne - now).total_seconds())} left)")
             else:
-                line = (f"  ⏳ next round {ns.strftime('%H:%M:%S')}–{ne.strftime('%H:%M:%S')} "
+                line = (f"  ⏳ next round {ns.strftime('%H:%M:%S')}–"
+                        f"{ne.strftime('%H:%M:%S')} "
                         f"in {_fmt_secs((ns - now).total_seconds())}  "
                         f"(wake in {_fmt_secs(delta)})")
 
-            pad = max(0, width - len(line))
-            print(f"\r{line}{' ' * pad}", end="", flush=True)
-            width = len(line)
-            time.sleep(1)
+            if not _quiet():
+                pad = max(0, width - len(line))
+                print(f"\r{line}{' ' * pad}", end="", flush=True)
+                width = len(line)
+            if _stop_event.wait(1):
+                return "stopped"
     finally:
-        print(f"\r{' ' * (width + 5)}\r", end="", flush=True)
+        if width:
+            print(f"\r{' ' * (width + 5)}\r", end="", flush=True)
+
 
 def _wait_probing(session, fallback_secs):
-    """No round known yet. Keep probing every PROBE_REFRESH_INTERVAL s."""
-    hard_end   = time.monotonic() + fallback_secs
+    hard_end = time.monotonic() + fallback_secs
     last_probe = 0.0
-    width      = 0
+    width = 0
     try:
         while time.monotonic() < hard_end:
-            now = datetime.now()
+            if _stop_event.is_set():
+                return "stopped"
+            now = _now()
 
             if time.monotonic() - last_probe >= PROBE_REFRESH_INTERVAL:
                 last_probe = time.monotonic()
                 refresh_next_round(session, now, force=True)
-                if _round_timer["next_end"] is not None:
+                if _stop_event.is_set():
+                    return "stopped"
+                if _rtimer()["next_end"] is not None:
                     return _wait_until_end(session)
 
             remaining = hard_end - time.monotonic()
-            line = (f"  🔍 searching for next round…  "
-                    f"(re-probe in {_fmt_secs(min(remaining, PROBE_REFRESH_INTERVAL))})")
-            pad = max(0, width - len(line))
-            print(f"\r{line}{' ' * pad}", end="", flush=True)
-            width = len(line)
-            time.sleep(1)
+            if not _quiet():
+                line = (f"  🔍 searching for next round…  "
+                        f"(re-probe in "
+                        f"{_fmt_secs(min(remaining, PROBE_REFRESH_INTERVAL))})")
+                pad = max(0, width - len(line))
+                print(f"\r{line}{' ' * pad}", end="", flush=True)
+                width = len(line)
+            if _stop_event.wait(1):
+                return "stopped"
     finally:
-        print(f"\r{' ' * (width + 5)}\r", end="", flush=True)
+        if width:
+            print(f"\r{' ' * (width + 5)}\r", end="", flush=True)
     return "fallback"
 
+
 def wait_for_round_end(fallback_secs=CYCLE_INTERVAL):
+    if _stop_event.is_set():
+        return "stopped"
     session = get_session()
-    now = datetime.now()
+    now = _now()
     _promote_expired_next(now)
 
-    if _round_timer["next_end"] is None:
+    if _rtimer()["next_end"] is None:
         refresh_next_round(session, now, force=True)
 
-    if _round_timer["next_end"] is None:
+    if _stop_event.is_set():
+        return "stopped"
+    if _rtimer()["next_end"] is None:
         return _wait_probing(session, fallback_secs)
 
     return _wait_until_end(session)
@@ -356,17 +451,17 @@ def wait_for_round_end(fallback_secs=CYCLE_INTERVAL):
 # ------------------------------------------------------------------ cycle
 def run_cycle(matches, done_rounds, attempts, skipped):
     session = get_session()
-    period = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    period = _now().strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.perf_counter()
     payload = fetch_json(session, period, level=2, tab="results", label="[P1]")
     p1 = time.perf_counter() - t0
 
     if payload is None:
-        print(f"  ⚠️  phase 1 failed ({p1:.1f}s)")
+        print(f"{_tag()}  ⚠️  phase 1 failed ({p1:.1f}s)")
         return 0
 
     data = payload.get("data") or {}
-    seen   = set()
+    seen = set()
     rounds = []
 
     def _collect(items):
@@ -383,29 +478,35 @@ def run_cycle(matches, done_rounds, attempts, skipped):
     _collect(data.get("results"))
 
     if not rounds:
-        print(f"  no rounds in data.results ({p1:.1f}s)")
+        print(f"{_tag()}  no rounds in data.results ({p1:.1f}s)")
         _collect(data.get("matches"))
         if rounds:
-            print(f"  [debug] recovered {len(rounds)} rounds from data.matches")
+            print(f"{_tag()}  [debug] recovered {len(rounds)} rounds from data.matches")
 
     if not rounds:
         return 0
 
     new_rounds = [
         r for r in rounds
-        if r["start_time"] not in done_rounds and r["start_time"] not in skipped
+        if r["start_time"] not in done_rounds
+        and r["start_time"] not in skipped
     ]
 
     if not new_rounds:
-        print(f"  {len(rounds)} rounds seen, 0 new  (phase 1: {p1:.1f}s)")
+        print(f"{_tag()}  {len(rounds)} rounds seen, 0 new  (phase 1: {p1:.1f}s)")
         return 0
 
-    print(f"  {len(rounds)} rounds seen, {len(new_rounds)} to fetch  "
+    print(f"{_tag()}  {len(rounds)} rounds seen, {len(new_rounds)} to fetch  "
           f"(phase 1: {p1:.1f}s)")
 
     t0 = time.perf_counter()
     added = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    league_state = (_cid(), _out_csv(), _quiet())
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS,
+        initializer=_set_league,
+        initargs=league_state,
+    ) as pool:
         futures = [pool.submit(worker, rnd) for rnd in new_rounds]
         for fut in as_completed(futures):
             rnd, ms, dt, ok = fut.result()
@@ -420,7 +521,7 @@ def run_cycle(matches, done_rounds, attempts, skipped):
                 done_rounds.add(st)
                 attempts.pop(st, None)
                 added += new_here
-                print(f"    round {rnd['round_id']:<5} {st}  "
+                print(f"{_tag()}    round {rnd['round_id']:<5} {st}  "
                       f"{dt*1000:>5.0f}ms  +{new_here:>3} new")
             else:
                 n = attempts.get(st, 0) + 1
@@ -428,73 +529,135 @@ def run_cycle(matches, done_rounds, attempts, skipped):
                 tag = "FAIL" if not ok else "EMPTY"
                 if n >= MAX_ROUND_ATTEMPTS:
                     skipped.add(st)
-                    print(f"    round {rnd['round_id']:<5} {st}  {tag}  "
+                    print(f"{_tag()}    round {rnd['round_id']:<5} {st}  {tag}  "
                           f"→ skipped after {n} attempts")
                 else:
-                    print(f"    round {rnd['round_id']:<5} {st}  {tag}  "
+                    print(f"{_tag()}    round {rnd['round_id']:<5} {st}  {tag}  "
                           f"(attempt {n}/{MAX_ROUND_ATTEMPTS})")
     p2 = time.perf_counter() - t0
 
     if added == 0:
-        print(f"  phase 2: no new matches  ({p2:.1f}s)")
+        print(f"{_tag()}  phase 2: no new matches  ({p2:.1f}s)")
     return added
 
-# ------------------------------------------------------------------ main
+
 def do_cycle(matches, done_rounds, attempts, skipped):
     t0 = time.perf_counter()
     try:
         added = run_cycle(matches, done_rounds, attempts, skipped)
     except Exception as e:
-        print(f"  ❌ cycle error: {e}")
+        print(f"{_tag()}  ❌ cycle error: {e}")
         added = 0
     elapsed = time.perf_counter() - t0
     if added > 0:
         try:
             write_csv(matches)
-            print(f"  ✅ +{added} new (total {len(matches)})  "
-                  f"cycle {elapsed:.1f}s  → {OUT_CSV}")
+            print(f"{_tag()}  ✅ +{added} new (total {len(matches)})  "
+                  f"cycle {elapsed:.1f}s  → {_out_csv()}")
         except Exception as e:
-            print(f"  ⚠️  write error: {e}")
+            print(f"{_tag()}  ⚠️  write error: {e}")
     else:
-        print(f"  💤 no new data  (cycle {elapsed:.1f}s)")
+        print(f"{_tag()}  💤 no new data  (cycle {elapsed:.1f}s)")
     return added
 
-def main():
-    matches, done_rounds = load_csv()
+# ------------------------------------------------------------------ run one
+def run_single(args):
+    out_csv = args.csv or Path(f"results_{args.competition}.csv")
+    _set_league(
+        args.competition,
+        out_csv,
+        quiet=getattr(args, "quiet", False),
+    )
 
-    print(f"📊 Loaded {OUT_CSV}")
-    print(f"   matches           : {len(matches)}")
-    print(f"   completed rounds  : {len(done_rounds)}")
-    print(f"   fallback interval : {CYCLE_INTERVAL}s")
-    print(f"   round buffer      : {ROUND_END_BUFFER_SECONDS}s after end_time")
-    print(f"   timer mode        : probe future periods, show next future round")
-    print(f"   Ctrl+C to stop\n")
-
+    matches = {}
+    done_rounds = set()
     attempts = {}
-    skipped  = set()
+    skipped = set()
     cycle = 0
 
     try:
-        cycle += 1
-        print(f"── cycle {cycle} @ {fmt_now()}  [startup] ──")
-        do_cycle(matches, done_rounds, attempts, skipped)
+        matches, done_rounds = load_csv()
+        _log(f"📊 Loaded {_out_csv()}")
+        _log(f"   competition       : {_cid()} "
+             f"({COMPETITIONS.get(_cid(), '?')})")
+        _log(f"   matches           : {len(matches)}")
+        _log(f"   completed rounds  : {len(done_rounds)}")
+        _log(f"   fallback interval : {CYCLE_INTERVAL}s")
+        _log(f"   round buffer      : {ROUND_END_BUFFER_SECONDS}s after end_time")
+        _log("   Ctrl+C to stop\n")
 
-        while True:
-            reason = wait_for_round_end(fallback_secs=CYCLE_INTERVAL)
+        if not _stop_event.is_set():
             cycle += 1
-            print(f"── cycle {cycle} @ {fmt_now()}  [trigger: {reason}] ──")
+            _log(f"── cycle {cycle} @ {fmt_now()}  [startup] ──")
+            do_cycle(matches, done_rounds, attempts, skipped)
+
+        while not _stop_event.is_set():
+            reason = wait_for_round_end(fallback_secs=CYCLE_INTERVAL)
+            if _stop_event.is_set() or reason == "stopped":
+                break
+            cycle += 1
+            _log(f"── cycle {cycle} @ {fmt_now()}  "
+                 f"[trigger: {reason}] ──")
             do_cycle(matches, done_rounds, attempts, skipped)
 
     except KeyboardInterrupt:
-        print(f"\n⏹  Ctrl+C — saving final snapshot...")
+        _stop_event.set()
+        _log("\n⏹  Ctrl+C — saving final snapshot...")
+    finally:
         try:
             write_csv(matches)
         except Exception as e:
-            print(f"  ⚠️  save error: {e}")
-        print(f"   Matches : {len(matches)}")
-        print(f"   Rounds  : {len(done_rounds)} completed, {len(skipped)} skipped")
-        print(f"   File    : {OUT_CSV}")
-        print(f"   Bye 👋")
+            _log(f"  ⚠️  save error: {e}")
+        _log(f"   Matches : {len(matches)}")
+        _log(f"   Rounds  : {len(done_rounds)} completed, "
+             f"{len(skipped)} skipped")
+        _log(f"   File    : {_out_csv()}")
+        _log("   Bye 👋")
+
+# ------------------------------------------------------------------ all mode
+def run_all(args):
+    """Run all 4 leagues concurrently as threads in one process."""
+    _stop_event.clear()
+    threads = []
+    for cid in COMPETITIONS:
+        t = threading.Thread(
+            target=run_single,
+            args=(argparse.Namespace(competition=cid, csv=None, quiet=True),),
+            name=f"league-{cid}",
+            daemon=False,
+        )
+        threads.append(t)
+        t.start()
+        print(f"  → {cid}:{COMPETITIONS[cid]:<8} thread started")
+
+    try:
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        print("\n⏹  Ctrl+C — stopping all leagues …")
+        _stop_event.set()
+        for t in threads:
+            t.join(timeout=5)
+
+# ------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--competition", default="all",
+                help="1=English 2=Spanish 3=Kenyan 4=Italian, or 'all' (default)")
+    ap.add_argument("--csv", type=Path, default=None,
+                    help="output csv (default: results_<cid>.csv)")
+    args = ap.parse_args()
+
+    if args.competition == "all":
+        run_all(args)
+        return
+
+    args.competition = int(args.competition)
+    if args.competition not in COMPETITIONS:
+        ap.error(f"unknown competition {args.competition}")
+    _stop_event.clear()
+    run_single(args)
+
 
 if __name__ == "__main__":
     main()
